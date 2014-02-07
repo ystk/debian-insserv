@@ -4,8 +4,10 @@ basedir=$(dirname $0)
 . $basedir/../tests/suite
 
 if head -1 debian/changelog | grep -q UNRELEASED ; then
+    # fatal
     severity=check
 else
+    # non-fatal
     severity=test
 fi
 
@@ -2075,6 +2077,7 @@ check_order 1 test3 test2
 check_order 1 test4 test1
 check_order 1 test4 test2
 
+rm -f $insconf.d/test3 $insconf.d/test4
 }
 ##########################################################################
 test_insserv_upstart() {
@@ -2120,6 +2123,10 @@ insert_upstart_job() {
     insserv_reg $name
 }
 
+remove_upstart_jobs() {
+    rm -rf $upstartdir
+}
+
 # XXX Someone that understand upstart need to fill in sensible stuff
 # here
 insert_upstart_job upstart-test <<EOF || true
@@ -2141,6 +2148,7 @@ list_rclinks
 
 # Undo upstart config
 insconf="$oldconf"
+remove_upstart_jobs
 }
 ##########################################################################
 
@@ -2159,7 +2167,7 @@ $local_fs       mountall
 EOF
 set -C
 
-insertscript hibernate <<EOF
+insertscript hibernate <<'EOF'
 ### BEGIN INIT INFO
 # Provides:          hibernate-cleanup
 # Default-Start:     S
@@ -2171,7 +2179,7 @@ insertscript hibernate <<EOF
 ### END INIT INFO
 EOF
 
-insertscript mountall.sh <<EOF
+insertscript mountall.sh <<'EOF'
 ### BEGIN INIT INFO
 # Provides:          mountall
 # Required-Start:
@@ -2183,7 +2191,7 @@ insertscript mountall.sh <<EOF
 EOF
 
 # Inserting this script should fail, as it introduces a loop
-insertscript mdadm <<EOF || true
+insertscript mdadm <<'EOF' || true
 ### BEGIN INIT INFO
 # Provides:          mdadm
 # Required-Start:    $local_fs
@@ -2194,7 +2202,7 @@ insertscript mdadm <<EOF || true
 EOF
 
 # Inserting this script should definitely fail, as it depend on a loop
-insertscript test <<EOF || true
+insertscript test <<'EOF' || true
 ### BEGIN INIT INFO
 # Provides:          test
 # Required-Start:    $local_fs mdadm
@@ -2206,10 +2214,202 @@ EOF
 
 list_rclinks
 
-${severity}_script_not_present S mdadm
-${severity}_script_not_present S test
+check_script_not_present S mdadm
+check_script_not_present S test
 }
 
+##########################################################################
+
+test_invalid_core_string() {
+echo
+echo "info: test if insserv accepts 'corekeeper' but rejects core dumps"
+echo "info: named '*.core' or 'core'"
+echo "info: See bug report #554905."
+echo
+
+initdir_purge
+
+set +C
+cat <<'EOF' > $insconf
+$local_fs       mountall
+EOF
+set -C
+
+# should be accepted - valid name
+insertscript corekeeper <<'EOF'
+### BEGIN INIT INFO
+# Provides:          corekeeper
+# Default-Start:     S
+# Default-Stop:
+# Required-Start:
+# Required-Stop:
+### END INIT INFO
+EOF
+
+# should be rejected - invalid name
+insertscript somescript.core <<'EOF'
+### BEGIN INIT INFO
+# Provides:          somescript
+# Default-Start:     S
+# Default-Stop:
+# Required-Start:
+# Required-Stop:
+### END INIT INFO
+EOF
+
+# should be rejected - invalid name
+insertscript core <<'EOF'
+### BEGIN INIT INFO
+# Provides:          someotherscript
+# Default-Start:     S
+# Default-Stop:
+# Required-Start:
+# Required-Stop:
+### END INIT INFO
+EOF
+
+list_rclinks
+
+check_script_not_present S core
+check_script_not_present S somescript
+check_script_present S corekeeper
+}
+##########################################################################
+insserv_show()
+{
+    $insserv $debug -c $insconf -p $initddir -o $overridedir -s
+}
+
+test_show_all() {
+echo
+echo "info: test if -s|--show-all option works as it should"
+echo
+
+initdir_purge
+
+insertscript bootscript <<'EOF'
+### BEGIN INIT INFO
+# Provides:          bootscript
+# Required-Start:
+# Required-Stop:
+# Default-Start:     S
+# Default-Stop:
+### END INIT INFO
+EOF
+
+insertscript localscript <<'EOF'
+### BEGIN INIT INFO
+# Provides:          localscript
+# Required-Start:
+# Required-Stop:
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+### END INIT INFO
+EOF
+
+insertscript shutdownscript <<'EOF'
+### BEGIN INIT INFO
+# Provides:          shutdownscript
+# Required-Start:
+# Required-Stop:
+# Default-Start:
+# Default-Stop:      0 6
+### END INIT INFO
+EOF
+
+check_script_present S bootscript
+check_script_present 2 localscript
+check_script_present 0 shutdownscript
+
+OLDIFS="$IFS"
+IFS=":"
+insserv_show | sort  -t: -k2 -k1 | while read IN_ACTION IN_SEQUENCE IN_LEVELS IN_BASENAME
+do
+    IN_LEVELS="$(echo "$IN_LEVELS" | sed -e 's; ;,;g')"
+    if [ "$IN_ACTION" = "S" ]; then
+	echo "$IN_SEQUENCE	-	$IN_LEVELS		/etc/init.d/$IN_BASENAME"
+    elif [ "$IN_ACTION" = "K" ]; then
+	echo "$IN_SEQUENCE	$IN_LEVELS	-		/etc/init.d/$IN_BASENAME"
+    fi
+done > ${tmpdir}/rc.conf
+IFS="$OLDIFS"
+
+cat ${tmpdir}/rc.conf
+
+if grep -qE '[[:digit:]]{2}[[:space:]]+-[[:space:]]+S[[:space:]]+/etc/init.d/bootscript' ${tmpdir}/rc.conf; then
+    counttest
+else
+    error "bootscript configuration error in rc.conf"
+fi
+
+if grep -qE '[[:digit:]]{2}[[:space:]]+-[[:space:]]+2,3,4,5[[:space:]]+/etc/init.d/localscript' ${tmpdir}/rc.conf && \
+   grep -qE '[[:digit:]]{2}[[:space:]]+0,1,6[[:space:]]+-[[:space:]]+/etc/init.d/localscript' ${tmpdir}/rc.conf; then
+    counttest
+else
+    error "localscript configuration error in rc.conf"
+fi
+
+if grep -qE '[[:digit:]]{2}[[:space:]]+0,6[[:space:]]+-[[:space:]]+/etc/init.d/shutdownscript' ${tmpdir}/rc.conf; then
+    counttest
+else
+    error "shutdownscript configuration error in rc.conf"
+fi
+
+rm -f ${tmpdir}/rc.conf
+}
+##########################################################################
+test_bootmisc_order() {
+# http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=677097
+echo
+echo "info: mountall-bootclean.sh must start before bootmisc.sh"
+echo
+
+initdir_purge
+
+set +C
+cat <<'EOF' > $insconf
+$local_fs       +mountall +mountall-bootclean
+$remote_fs      $local_fs
+EOF
+set -C
+
+insertscript mountall.sh <<'EOF'
+### BEGIN INIT INFO
+# Provides:          mountall
+# Required-Start:
+# Required-Stop:
+# Default-Start:     S
+# Default-Stop:
+### END INIT INFO
+EOF
+
+insertscript mountall-bootclean.sh <<'EOF'
+### BEGIN INIT INFO
+# Provides:          mountall-bootclean
+# Required-Start:    mountall
+# Required-Stop:
+# Default-Start:     S
+# Default-Stop:
+### END INIT INFO
+EOF
+
+insertscript bootmisc.sh <<'EOF'
+### BEGIN INIT INFO
+# Provides:          bootmisc
+# Required-Start:    $remote_fs
+# Required-Stop:
+# Default-Start:     S
+# Default-Stop:
+### END INIT INFO
+EOF
+
+list_rclinks
+
+check_order S mountall.sh mountall-bootclean.sh
+check_order S mountall-bootclean.sh bootmisc.sh
+
+update_conf
+}
 ##########################################################################
 
 test_normal_sequence
@@ -2252,3 +2452,6 @@ test_insserv_virt_loop
 test_local_virtual
 test_insserv_upstart
 test_undetected_loop		# 2 non-fatal tests failing
+test_invalid_core_string
+test_show_all
+test_bootmisc_order
